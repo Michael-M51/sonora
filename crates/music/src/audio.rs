@@ -30,6 +30,85 @@ impl Volume {
     }
 }
 
+/// A second gain beside the volume, for a fade the listener sets the length of. The volume
+/// always ramps over `RAMP`; this one ramps over whatever `go` and `restart` are given, so a
+/// pause can fade out and a play can fade in. Shared like `Volume`: the output reads it on the
+/// audio thread while the app writes it.
+#[derive(Clone, Debug)]
+pub struct Fade {
+    goal: Arc<AtomicU32>,
+    millis: Arc<AtomicU32>,
+    from: Arc<AtomicU32>,
+    restarts: Arc<AtomicU32>,
+}
+
+impl Default for Fade {
+    fn default() -> Self {
+        Self {
+            goal: Arc::new(AtomicU32::new(1f32.to_bits())),
+            millis: Arc::new(AtomicU32::new(0)),
+            from: Arc::new(AtomicU32::new(1f32.to_bits())),
+            restarts: Arc::new(AtomicU32::new(0)),
+        }
+    }
+}
+
+impl Fade {
+    /// Ramps from wherever the fade stands to `goal` over `span`. A zero span ramps over `RAMP`.
+    pub fn go(&self, goal: f32, span: Duration) {
+        self.millis.store(
+            span.as_millis().try_into().unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
+        self.goal.store(goal.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Jumps to `from` at the next frame and ramps to `goal` over `span`, for a fade-in from
+    /// silence however loud the last one left it.
+    pub fn restart(&self, from: f32, goal: f32, span: Duration) {
+        self.from.store(from.to_bits(), Ordering::Relaxed);
+        self.go(goal, span);
+        self.restarts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn goal(&self) -> f32 {
+        f32::from_bits(self.goal.load(Ordering::Relaxed))
+    }
+
+    fn from(&self) -> f32 {
+        f32::from_bits(self.from.load(Ordering::Relaxed))
+    }
+
+    fn span(&self) -> Duration {
+        match self.millis.load(Ordering::Relaxed) {
+            0 => RAMP,
+            millis => Duration::from_millis(millis.into()),
+        }
+    }
+
+    fn restarts(&self) -> u32 {
+        self.restarts.load(Ordering::Relaxed)
+    }
+}
+
+/// How long the end of a track overlaps the start of the next, in milliseconds, with zero for no
+/// overlap. Shared with the app like `Fade`, so a change reaches the engine without a restart.
+#[derive(Clone, Debug, Default)]
+pub struct Crossfade(Arc<AtomicU32>);
+
+impl Crossfade {
+    pub fn set(&self, span: Duration) {
+        self.0.store(
+            span.as_millis().try_into().unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn get(&self) -> Duration {
+        Duration::from_millis(self.0.load(Ordering::Relaxed).into())
+    }
+}
+
 /// The loudest sample any output sent its device since the meter was last read, after the
 /// volume and before the clamp an integer device gets, so an over shows however the device
 /// takes it. Every output shares one.
@@ -133,6 +212,8 @@ impl Frames {
 /// end. Every engine builds one and hands it to the output.
 pub struct Chain {
     pub volume: Volume,
+    /// The fade a pause and a play ramp, shared with the app like `meter`.
+    pub fade: Fade,
     /// Hears the music ahead of the equalizer for the equalizer screen, shared like `meter`.
     pub analyzer: Analyzer,
     pub equalizer: Equalizer,
@@ -177,6 +258,15 @@ pub(crate) struct Chained<I> {
     step: f32,
     frames_left: u32,
     ramp_frames: u32,
+
+    fade: Fade,
+    fade_current: f32,
+    /// The goal the fade ramp last aimed at. NaN after a restart, so the ramp starts again even
+    /// when the goal is the one it already had.
+    fade_target: f32,
+    fade_step: f32,
+    fade_left: u32,
+    fade_restarts: u32,
 }
 
 impl<I: Source> Chained<I> {
@@ -197,6 +287,41 @@ impl<I: Source> Chained<I> {
             step: 0.0,
             frames_left: 0,
             ramp_frames: 1,
+            fade: chain.fade.clone(),
+            fade_current: chain.fade.goal(),
+            fade_target: chain.fade.goal(),
+            fade_step: 0.0,
+            fade_left: 0,
+            fade_restarts: chain.fade.restarts(),
+        }
+    }
+
+    /// Moves the fade one frame along its ramp, starting a new ramp when the app asked for one.
+    fn fade_frame(&mut self) {
+        let restarts = self.fade.restarts();
+        if restarts != self.fade_restarts {
+            self.fade_restarts = restarts;
+            self.fade_current = self.fade.from();
+            self.fade_target = f32::NAN;
+        }
+
+        let goal = self.fade.goal();
+        if goal.to_bits() != self.fade_target.to_bits() {
+            let frames = (self.fade.span().as_secs_f64() * self.frames.rate() as f64)
+                .round()
+                .max(1.0) as u32;
+            self.fade_target = goal;
+            self.fade_left = frames;
+            self.fade_step = (goal - self.fade_current) / frames as f32;
+        }
+
+        if self.fade_left > 0 {
+            self.fade_current += self.fade_step;
+            self.fade_left -= 1;
+
+            if self.fade_left == 0 {
+                self.fade_current = self.fade_target;
+            }
         }
     }
 
@@ -244,10 +369,11 @@ impl<I: Source> Iterator for Chained<I> {
                     self.current = self.target;
                 }
             }
+            self.fade_frame();
         }
 
         let equalized = self.equalizer.process(usize::from(place.channel), sample);
-        let output = equalized * self.current;
+        let output = equalized * self.current * self.fade_current;
         let heard = match self.unscaled {
             true => equalized,
             false => output,

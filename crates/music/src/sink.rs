@@ -530,7 +530,7 @@ pub fn packet(samples: Vec<f32>, channels: u16, rate: u32) -> Option<Packet> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::{Meter, Volume};
+    use crate::audio::{Fade, Meter, Volume};
     use crate::equalizer::{Curve, EqualizerWriter};
     use crate::spectrum::{Analyzer, Spectrum};
 
@@ -585,6 +585,7 @@ mod tests {
         let writer = EqualizerWriter::new(true, Curve::bands(&[12.; 10]));
         let chain = Chain {
             volume: Volume::new(0.5),
+            fade: Fade::default(),
             equalizer: writer.reader(),
             spectrum: Spectrum::new(),
             meter: Meter::default(),

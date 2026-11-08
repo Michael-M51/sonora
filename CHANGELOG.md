@@ -7,6 +7,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Playback settings can fade the music out when you pause and back in when you play, from zero to one second.
+- Playback settings can crossfade the end of a track into the start of the next, up to ten seconds.
+
 ## [0.48.1] - 2026-11-08
 
 ### Changed

@@ -50,7 +50,7 @@ use time::format_description::well_known::Iso8601;
 use time::parsing::Parsed;
 use time::{Month, OffsetDateTime};
 
-pub use audio::Meter;
+pub use audio::{Crossfade, Fade, Meter};
 pub use equalizer::Equalizer;
 pub use models::{
     Album, AlbumCatalogue, AlbumDetail, Artist, ArtistCatalogue, ArtistProfile, ArtistRef,
@@ -421,6 +421,12 @@ pub struct PlaybackConfig {
     pub quality: Quality,
     /// Shared like `equalizer`: every output the engine opens reports its loudest sample here.
     pub meter: Meter,
+    /// Shared like `meter`: every output the engine opens ramps its sound by it, so the app can
+    /// fade a pause out and a play in.
+    pub fade: Fade,
+    /// Shared like `fade`: how long the end of a track overlaps the start of the next. Spotify
+    /// decodes inside librespot, which has no overlap to offer, so it ignores this.
+    pub crossfade: Crossfade,
     /// Shared like `equalizer`: every output the engine opens lets it hear the music ahead of the
     /// equalizer while it is watched.
     pub analyzer: Analyzer,

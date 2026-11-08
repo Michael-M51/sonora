@@ -9,8 +9,8 @@ use gpui::{App, AppContext as _, Context, Entity, EventEmitter, SharedString, Ta
 use music::connect::{self, Command, Repeat};
 use music::vault::Vault;
 use music::{
-    Analyzer, Meter, MusicApi, PlaybackConfig, PlaybackEvent as BackendEvent, PlaybackEvents,
-    PlaybackFactory, Player, Quality, Spectrum, Track, TrackSignal, Transcode,
+    Analyzer, Crossfade, Fade, Meter, MusicApi, PlaybackConfig, PlaybackEvent as BackendEvent,
+    PlaybackEvents, PlaybackFactory, Player, Quality, Spectrum, Track, TrackSignal, Transcode,
 };
 use ui::{Pin, PinKind};
 
@@ -444,6 +444,22 @@ pub struct Playback {
     equalizer: music::Equalizer,
     /// Shared with every engine like the equalizer's reader, and read only while watched.
     meter: Meter,
+    /// Shared with every engine like the meter. A fade-out ramps it down before the engine is
+    /// paused, and a play ramps it back up.
+    fade: Fade,
+    /// Whether pausing fades the sound out and playing fades it in, and for how many
+    /// milliseconds.
+    fade_on: bool,
+    fade_ms: u32,
+    /// How long a track overlaps the next, shared with every engine like `fade`, and its length
+    /// in milliseconds.
+    crossfade: Crossfade,
+    crossfade_ms: u32,
+    /// The wait before an engine is paused, while a fade-out plays. Dropping it cancels the pause.
+    fading: Option<Task<()>>,
+    /// Whether a fade-out has left the sound at silence, or is on its way there. The sound stays
+    /// silent through the pause, and whatever plays next brings it back.
+    silenced: bool,
     /// Shared with every engine like the meter, so the equalizer screen can hear the music ahead
     /// of the equalizer.
     analyzer: Analyzer,
@@ -586,6 +602,11 @@ impl Playback {
         let level = settings.read(cx).volume();
         let normalisation = settings.read(cx).normalisation();
         let gapless = settings.read(cx).gapless();
+        let fade_on = settings.read(cx).fade();
+        let fade_ms = settings.read(cx).fade_ms();
+        let crossfade_ms = settings.read(cx).crossfade_ms();
+        let crossfade = Crossfade::default();
+        crossfade.set(Duration::from_millis(crossfade_ms.into()));
         let transcode = settings.read(cx).transcode();
         let quality = settings.read(cx).quality();
         let keep_tracks = settings.read(cx).keep_tracks();
@@ -622,6 +643,13 @@ impl Playback {
             measuring: None,
             equalizer,
             meter,
+            fade: Fade::default(),
+            fade_on,
+            fade_ms,
+            crossfade,
+            crossfade_ms,
+            fading: None,
+            silenced: false,
             analyzer: Analyzer::default(),
             signals: VecDeque::new(),
             repeat,
@@ -906,6 +934,7 @@ impl Playback {
     /// Loading from here until the engine reports audio; a refusal or an unplayable track fails
     /// without reaching the engine.
     fn load_from(&mut self, track: &Track, at: Duration, start: Start, cx: &mut Context<Self>) {
+        self.unfade();
         let Some(id) = track.id.clone() else {
             return self.failed(format!("{} has no track id", track.name), cx);
         };
@@ -1504,7 +1533,8 @@ impl Playback {
         };
         if duration.is_zero()
             || self.state != PlaybackState::Playing
-            || duration.saturating_sub(position) > PRELOAD_BEFORE_END
+            || duration.saturating_sub(position)
+                > PRELOAD_BEFORE_END + Duration::from_millis(self.crossfade_ms.into())
         {
             return;
         }
@@ -1912,6 +1942,8 @@ impl Playback {
         }
         self.intent = Intent::Play;
         self.pressed = Some(Instant::now());
+        let interrupted = self.fading.take().is_some();
+        self.fade_in(interrupted);
         if let Some(at) = self.resume_at {
             if !self.resume_ready {
                 return self.reload_and_seek(at, cx);
@@ -2024,10 +2056,122 @@ impl Playback {
         }
         self.intent = Intent::Pause;
         self.pressed = Some(Instant::now());
+        if let Some(span) = self.fade_span()
+            && self.state == PlaybackState::Playing
+            && self.active_engine().is_some()
+        {
+            return self.fade_out(span, cx);
+        }
         if let Some(engine) = self.active_engine() {
             engine.pause();
             cx.notify();
         }
+    }
+
+    /// How long a pause fades out and a play fades in, or `None` with the fade switched off or
+    /// its length at zero.
+    fn fade_span(&self) -> Option<Duration> {
+        self.fade_on
+            .then(|| Duration::from_millis(self.fade_ms.into()))
+            .filter(|span| !span.is_zero())
+    }
+
+    /// Ramps the sound down over `span` and pauses the engine once it is silent. The intent has
+    /// moved already, so controls show the pause at once.
+    fn fade_out(&mut self, span: Duration, cx: &mut Context<Self>) {
+        if self.fading.is_some() {
+            return;
+        }
+        self.silenced = true;
+        self.fade.go(0., span);
+        let id = self.track.as_ref().and_then(|track| track.id.clone());
+        self.fading = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(span).await;
+            this.update(cx, |this, cx| this.finish_fade(id, cx)).ok();
+        }));
+        cx.notify();
+    }
+
+    /// Pauses the engine at the end of a fade-out, unless the listener has played again or moved
+    /// on to another track since. The sound is left silent: the pause takes a moment to reach the
+    /// output, and audio already queued must not be heard at full in that moment.
+    fn finish_fade(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        self.fading = None;
+        let current = self.track.as_ref().and_then(|track| track.id.as_deref());
+        if self.intent == Intent::Pause
+            && current == id.as_deref()
+            && let Some(engine) = self.active_engine()
+        {
+            engine.pause();
+        }
+        cx.notify();
+    }
+
+    /// Brings the sound back to full for a track or engine that starts without a play, after a
+    /// fade-out left it silent or a track was picked in the middle of one, and cancels the pause
+    /// that fade-out was waiting for.
+    fn unfade(&mut self) {
+        if !std::mem::take(&mut self.silenced) {
+            return;
+        }
+        self.fading = None;
+        self.fade.go(1., Duration::ZERO);
+    }
+
+    /// Ramps the sound up as the engine plays on: from where a fade-out in flight stands, or
+    /// from silence. With the fade off it only makes sure the sound is back at full.
+    fn fade_in(&mut self, interrupted: bool) {
+        self.silenced = false;
+        match (self.fade_span(), interrupted) {
+            (Some(span), true) => self.fade.go(1., span),
+            (Some(span), false) => self.fade.restart(0., 1., span),
+            (None, _) => self.fade.go(1., Duration::ZERO),
+        }
+    }
+
+    pub fn fade(&self) -> bool {
+        self.fade_on
+    }
+
+    pub fn fade_ms(&self) -> u32 {
+        self.fade_ms
+    }
+
+    pub fn set_fade(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.fade_on == on {
+            return;
+        }
+        self.fade_on = on;
+        self.settings
+            .update(cx, |settings, cx| settings.set_fade(on, cx));
+        cx.notify();
+    }
+
+    pub fn crossfade_ms(&self) -> u32 {
+        self.crossfade_ms
+    }
+
+    /// Sets how long a track overlaps the next. The engines read it as they go, so the track
+    /// playing is not reloaded.
+    pub fn set_crossfade_ms(&mut self, millis: u32, cx: &mut Context<Self>) {
+        if self.crossfade_ms == millis {
+            return;
+        }
+        self.crossfade_ms = millis;
+        self.crossfade.set(Duration::from_millis(millis.into()));
+        self.settings
+            .update(cx, |settings, cx| settings.set_crossfade_ms(millis, cx));
+        cx.notify();
+    }
+
+    pub fn set_fade_ms(&mut self, millis: u32, cx: &mut Context<Self>) {
+        if self.fade_ms == millis {
+            return;
+        }
+        self.fade_ms = millis;
+        self.settings
+            .update(cx, |settings, cx| settings.set_fade_ms(millis, cx));
+        cx.notify();
     }
 
     pub fn toggle_play(&mut self, cx: &mut Context<Self>) {
@@ -2672,6 +2816,7 @@ impl Playback {
 
     /// Builds the streaming engine and starts pumping its events.
     fn start_engine(&mut self, playback: Arc<dyn PlaybackFactory>, cx: &mut Context<Self>) {
+        self.unfade();
         let config = PlaybackConfig {
             normalisation: self.normalisation,
             gapless: self.gapless,
@@ -2681,6 +2826,8 @@ impl Playback {
             quality: self.quality,
             equalizer: self.equalizer.clone(),
             meter: self.meter.clone(),
+            fade: self.fade.clone(),
+            crossfade: self.crossfade.clone(),
             analyzer: self.analyzer.clone(),
             vault: Some(self.vault.clone()),
         };
@@ -2699,6 +2846,7 @@ impl Playback {
     }
 
     fn start_local_engine(&mut self, playback: Arc<dyn PlaybackFactory>, cx: &mut Context<Self>) {
+        self.unfade();
         let config = PlaybackConfig {
             normalisation: self.normalisation,
             gapless: self.gapless,
@@ -2708,6 +2856,8 @@ impl Playback {
             quality: self.quality,
             equalizer: self.equalizer.clone(),
             meter: self.meter.clone(),
+            fade: self.fade.clone(),
+            crossfade: self.crossfade.clone(),
             analyzer: self.analyzer.clone(),
             vault: Some(self.vault.clone()),
         };

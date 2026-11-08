@@ -83,9 +83,10 @@ pub use scrobble::{ScrobbleRow, ScrobbleState, Scrobbling};
 pub use search::{AlbumHit, ArtistHit, Hit, Kind, PlaylistHit, Search};
 pub use session::{Failure, ProviderInfo, Session, SessionEvent, SessionState};
 pub use settings::{
-    AppSettings, ConnectName, DiscordName, FilterValue, FullscreenControlsAutohide, LYRICS_SOURCES,
-    PlayerBarLayout, Reloaded, RomanizationScripts, SYSTEM_FONT, SideTab, ThemeFamily, ThemeOffer,
-    ThemeVariant, equalizer_profile_label, remember_window, window_placement,
+    AppSettings, CROSSFADE_RANGE_MS, CROSSFADE_STEP_MS, ConnectName, DiscordName, FADE_RANGE_MS,
+    FADE_STEP_MS, FilterValue, FullscreenControlsAutohide, LYRICS_SOURCES, PlayerBarLayout,
+    Reloaded, RomanizationScripts, SYSTEM_FONT, SideTab, ThemeFamily, ThemeOffer, ThemeVariant,
+    equalizer_profile_label, remember_window, window_placement,
 };
 pub use signal::{Change, Equalizing, FLOAT_BITS, Following, Signal, SignalPath};
 pub use song::SongDetail;

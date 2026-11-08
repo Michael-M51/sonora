@@ -303,6 +303,13 @@ const DEFAULT_SIDEBAR_RIGHT_WIDTH: f32 = 254.;
 const DEFAULT_FONT_SIZE: f32 = 14.;
 const DEFAULT_LYRICS_SCALE: f32 = 1.;
 const DEFAULT_STARTUP: &str = "home";
+/// The shortest and longest fade the slider sets, and the step between them, in milliseconds.
+pub const FADE_RANGE_MS: (u32, u32) = (0, 1000);
+pub const FADE_STEP_MS: u32 = 50;
+/// The same for the overlap between tracks.
+pub const CROSSFADE_RANGE_MS: (u32, u32) = (0, 10_000);
+pub const CROSSFADE_STEP_MS: u32 = 500;
+const FADE_DEFAULT_MS: u32 = 300;
 /// "Whatever the platform uses".
 pub const SYSTEM_FONT: &str = "auto";
 /// Every lyrics source Sonora knows by the name its provider reports, in the order a fresh
@@ -335,6 +342,13 @@ struct Held {
 struct Values {
     normalisation: bool,
     gapless: bool,
+    /// Whether pausing fades the sound out and playing fades it in.
+    fade: bool,
+    /// How long that fade lasts, in milliseconds, in steps of `FADE_STEP_MS`.
+    fade_ms: u32,
+    /// How long the end of a track overlaps the start of the next, in milliseconds, in steps of
+    /// `CROSSFADE_STEP_MS`. Zero plays them end to end.
+    crossfade_ms: u32,
     /// Whether played tracks are kept, sealed, so playing one again downloads nothing.
     keep_tracks: bool,
     /// How many gigabytes the cache of played tracks may take. Downloads do not count.
@@ -583,6 +597,9 @@ impl Default for Values {
         Self {
             normalisation: false,
             gapless: true,
+            fade: false,
+            fade_ms: FADE_DEFAULT_MS,
+            crossfade_ms: 0,
             keep_tracks: true,
             offline_mode: false,
             cache_gb: crate::vault::CACHE_GB,
@@ -960,6 +977,25 @@ impl AppSettings {
 
     pub fn gapless(&self) -> bool {
         self.values.gapless
+    }
+
+    pub fn fade(&self) -> bool {
+        self.values.fade
+    }
+
+    /// The crossfade length in milliseconds, held to the range the slider offers.
+    pub fn crossfade_ms(&self) -> u32 {
+        clamp_step(
+            self.values.crossfade_ms,
+            CROSSFADE_RANGE_MS,
+            CROSSFADE_STEP_MS,
+        )
+    }
+
+    /// The fade length in milliseconds, held to the range the slider offers so a hand-edited
+    /// file cannot ask for a fade that never ends.
+    pub fn fade_ms(&self) -> u32 {
+        clamp_step(self.values.fade_ms, FADE_RANGE_MS, FADE_STEP_MS)
     }
 
     pub fn keep_tracks(&self) -> bool {
@@ -1560,6 +1596,21 @@ impl AppSettings {
 
     pub fn set_gapless(&mut self, gapless: bool, cx: &mut Context<Self>) {
         self.values.gapless = gapless;
+        self.schedule_save(cx);
+    }
+
+    pub fn set_fade(&mut self, fade: bool, cx: &mut Context<Self>) {
+        self.values.fade = fade;
+        self.schedule_save(cx);
+    }
+
+    pub fn set_fade_ms(&mut self, millis: u32, cx: &mut Context<Self>) {
+        self.values.fade_ms = clamp_step(millis, FADE_RANGE_MS, FADE_STEP_MS);
+        self.schedule_save(cx);
+    }
+
+    pub fn set_crossfade_ms(&mut self, millis: u32, cx: &mut Context<Self>) {
+        self.values.crossfade_ms = clamp_step(millis, CROSSFADE_RANGE_MS, CROSSFADE_STEP_MS);
         self.schedule_save(cx);
     }
 
@@ -2947,6 +2998,11 @@ fn take(pinned: &mut Vec<Held>, slug: &str, pin: &Pin) -> bool {
 
 /// Carries the position over from the previous record while the same track is current on the
 /// same provider.
+/// A length in milliseconds held to a slider's range and rounded to its step.
+fn clamp_step(millis: u32, (low, high): (u32, u32), step: u32) -> u32 {
+    (millis.clamp(low, high) + step / 2) / step * step
+}
+
 fn carry(previous: Option<&Resume>, next: &mut Resume) {
     let playing = |resume: &Resume| resume.current.as_ref().map(|stub| stub.id.clone());
     let same = previous.filter(|old| old.provider == next.provider);

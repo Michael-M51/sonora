@@ -7,9 +7,11 @@ use i18n::t;
 use music::drm::Origin;
 use music::{Codec, Encoding, Offer, Quality, Transcode};
 use state::{CdmState, Sleep};
-use ui::{ActiveTheme as _, Button, MenuItem, OptionCard, Picker, Scrubber, Switch, Text};
+use ui::{
+    ActiveTheme as _, Button, MenuItem, OptionCard, Picker, Scrubber, ScrubberState, Switch, Text,
+};
 
-use super::rows::{Announced as _, grid, segmented};
+use super::rows::{Announced as _, Row, grid, segmented};
 use super::{Group, SettingsView, Slot};
 use crate::shared::confirm::{Confirm, Kind};
 
@@ -35,7 +37,14 @@ impl SettingsView {
         let capabilities = self.session.read(cx).capabilities();
         let mut playing = vec![Slot::Normalisation, Slot::Gapless];
         playing.extend([Slot::Sleep, Slot::StayAwake]);
-        let mut groups = vec![Group::new("settings-group-playing", "icons/play.svg").rows(playing)];
+        let mut groups = vec![
+            Group::new("settings-group-playing", "icons/play.svg").rows(playing),
+            Group::new("settings-group-fading", "icons/volume-2.svg").rows([
+                Slot::Fade,
+                Slot::FadeLength,
+                Slot::Crossfade,
+            ]),
+        ];
         // one level is nothing to choose between, so it is stated in a row rather than offered
         match capabilities.qualities.len() {
             0 => {}
@@ -98,6 +107,149 @@ impl SettingsView {
                 }))
                 .into_any_element(),
         )
+    }
+
+    pub(super) fn fade_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let on = self.playback.read(cx).fade();
+
+        self.row(
+            t!("settings-fade"),
+            Switch::new("fade", on)
+                .name(t!("settings-fade"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.playback
+                        .update(cx, |playback, cx| playback.set_fade(!on, cx));
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// How long a pause or play takes to fade, muted while the fade is off. The label follows a
+    /// drag at once, and the length is set when the drag lets go.
+    pub(super) fn fade_length_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let on = self.playback.read(cx).fade();
+        let current = self
+            .pending_fade
+            .unwrap_or_else(|| self.playback.read(cx).fade_ms());
+
+        self.length_slider(
+            LengthSlider {
+                title: t!("settings-fade-length"),
+                slider: "settings-fade-slider",
+                value: "settings-fade-value",
+                state: &self.fade_length,
+                millis: current,
+                range: state::FADE_RANGE_MS,
+                step: state::FADE_STEP_MS,
+                label: t!("settings-fade-length-value", seconds = seconds(current, 2)),
+                enabled: on,
+            },
+            |this, millis| this.pending_fade = Some(millis),
+            |this, cx| {
+                let Some(millis) = this.pending_fade.take() else {
+                    return;
+                };
+                this.playback
+                    .update(cx, |playback, cx| playback.set_fade_ms(millis, cx));
+            },
+            cx,
+        )
+    }
+
+    /// How long a track overlaps the next, from off at the left. Followed and set like the fade
+    /// length.
+    pub(super) fn crossfade_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self
+            .pending_crossfade
+            .unwrap_or_else(|| self.playback.read(cx).crossfade_ms());
+        let label = match current {
+            0 => t!("settings-crossfade-off"),
+            _ => t!("settings-crossfade-value", seconds = seconds(current, 1)),
+        };
+
+        self.length_slider(
+            LengthSlider {
+                title: t!("settings-crossfade"),
+                slider: "settings-crossfade-slider",
+                value: "settings-crossfade-label",
+                state: &self.crossfade,
+                millis: current,
+                range: state::CROSSFADE_RANGE_MS,
+                step: state::CROSSFADE_STEP_MS,
+                label,
+                enabled: true,
+            },
+            |this, millis| this.pending_crossfade = Some(millis),
+            |this, cx| {
+                let Some(millis) = this.pending_crossfade.take() else {
+                    return;
+                };
+                this.playback
+                    .update(cx, |playback, cx| playback.set_crossfade_ms(millis, cx));
+            },
+            cx,
+        )
+    }
+
+    /// A row with a slider that moves a length in whole steps, the length written before it.
+    /// `on_move` hears each step while it is dragged and `on_release` when it lets go.
+    fn length_slider(
+        &self,
+        slider: LengthSlider,
+        on_move: impl Fn(&mut Self, u32) + 'static,
+        on_release: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = *cx.theme();
+        let (low, high) = slider.range;
+        let (step, steps) = (slider.step, (high - low) / slider.step);
+        let fraction = slider.millis.saturating_sub(low) as f32 / (high - low) as f32;
+
+        let control = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(
+                ui::spoken(slider.value, slider.label.clone())
+                    .flex_none()
+                    .w(theme.metrics.cover * SLEEP_LABEL)
+                    .whitespace_nowrap()
+                    .text_right()
+                    .text_color(match slider.enabled {
+                        true => theme.foreground,
+                        false => theme.muted_foreground,
+                    }),
+            )
+            .child(
+                div()
+                    .id(slider.slider)
+                    .role(Role::Group)
+                    .aria_label(slider.title.clone())
+                    .w(theme.metrics.cover * SLEEP_WIDTH)
+                    .child(
+                        Scrubber::new(slider.state, fraction)
+                            .name(slider.title.clone())
+                            .value(slider.label)
+                            .enabled(slider.enabled)
+                            .colors(
+                                theme.progress_bar,
+                                theme.muted_foreground.opacity(0.3),
+                                theme.foreground,
+                            )
+                            .on_move(cx.listener(move |this, fraction: &f32, _, cx| {
+                                let slot = (fraction.clamp(0., 1.) * steps as f32).round() as u32;
+                                on_move(this, low + slot * step);
+                                cx.notify();
+                            }))
+                            .on_release(cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                                on_release(this, cx)
+                            })),
+                    ),
+            );
+
+        Row::new(slider.title, control.into_any_element())
+            .disabled(!slider.enabled)
+            .into_any_element()
     }
 
     pub(super) fn keep_tracks_row(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -446,6 +598,25 @@ impl SettingsView {
             })
             .into_any_element()
     }
+}
+
+/// What `length_slider` draws: a length between `range` milliseconds that moves in `step`s, the
+/// element ids of its slider and of the label beside it, and whether it can be moved.
+struct LengthSlider<'a> {
+    title: SharedString,
+    slider: &'static str,
+    value: &'static str,
+    state: &'a ScrubberState,
+    millis: u32,
+    range: (u32, u32),
+    step: u32,
+    label: SharedString,
+    enabled: bool,
+}
+
+/// A length in milliseconds as seconds to `places` decimals, for the label beside a slider.
+fn seconds(millis: u32, places: usize) -> String {
+    format!("{:.places$}", f64::from(millis) / 1000.)
 }
 
 /// What the Widevine row says: the detail key for its state, and the note beside it.
